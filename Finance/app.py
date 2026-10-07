@@ -10,6 +10,9 @@ from helpers import apology, login_required, lookup, usd
 # Configure application
 app = Flask(__name__)
 
+# Secret key for sessions and flash messages
+app.secret_key = os.environ.get("SECRET_KEY", "fallback-dev-secret-key")
+
 # Custom filter
 app.jinja_env.filters["usd"] = usd
 
@@ -18,8 +21,15 @@ app.config["SESSION_PERMANENT"] = False
 app.config["SESSION_TYPE"] = "filesystem"
 Session(app)
 
-# Configure CS50 Library to use SQLite database
-db = SQL("sqlite:///finance.db")
+# Configure Database Connection (Supports PostgreSQL in production & fallback to SQLite)
+db_url = os.environ.get("DATABASE_URL")
+if db_url:
+    # Heroku / Render use "postgres://", which SQLAlchemy / cs50 expects as "postgresql://"
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql://", 1)
+    db = SQL(db_url)
+else:
+    db = SQL(f"sqlite:///{os.path.join(app.root_path, 'finance.db')}")
 
 
 @app.after_request
@@ -35,11 +45,13 @@ def after_request(response):
 @login_required
 def index():
     """Show portfolio of stocks"""
-
     rows = db.execute("SELECT cash FROM users WHERE id = ?", session["user_id"])
     cash = rows[0]["cash"]
 
-    stocks = db.execute("SELECT symbol, SUM(shares) as total_shares FROM transactions WHERE user_id = ? GROUP BY symbol HAVING total_shares > 0", session["user_id"])
+    stocks = db.execute(
+        "SELECT symbol, SUM(shares) as total_shares FROM transactions WHERE user_id = ? GROUP BY symbol HAVING total_shares > 0",
+        session["user_id"],
+    )
 
     portfolio = []
     grand_total = cash
@@ -48,22 +60,29 @@ def index():
         quote = lookup(stock["symbol"])
         if quote:
             stock_value = stock["total_shares"] * quote["price"]
-            portfolio.append({
-                "symbol": stock["symbol"],
-                "shares": stock["total_shares"],
-                "price": quote["price"],
-                "total": stock_value
-             })
+            portfolio.append(
+                {
+                    "symbol": stock["symbol"],
+                    "shares": stock["total_shares"],
+                    "price": quote["price"],
+                    "total": stock_value,
+                }
+            )
             grand_total += stock_value
 
-    return render_template("index.html", portfolio=portfolio, cash=cash, grand_total=grand_total)
+    return render_template(
+        "index.html", portfolio=portfolio, cash=cash, grand_total=grand_total
+    )
+
 
 @app.route("/buy", methods=["GET", "POST"])
 @login_required
 def buy():
     """Buy shares of stock"""
     if request.method == "POST":
-        symbol = request.form.get("symbol").upper()
+        symbol = request.form.get("symbol")
+        if symbol:
+            symbol = symbol.upper()
         shares = request.form.get("shares")
 
         if not symbol:
@@ -71,7 +90,7 @@ def buy():
         if not shares or not shares.isdigit() or int(shares) <= 0:
             return apology("must provide positive integer number of shares", 400)
 
-        shares  = int(shares)
+        shares = int(shares)
         quote = lookup(symbol)
 
         if not quote:
@@ -85,9 +104,19 @@ def buy():
         if total_cost > cash:
             return apology("can't afford", 400)
 
-        db.execute("UPDATE users SET cash = cash - ? WHERE id = ?", total_cost, session["user_id"])
+        db.execute(
+            "UPDATE users SET cash = cash - ? WHERE id = ?",
+            total_cost,
+            session["user_id"],
+        )
 
-        db.execute("INSERT INTO transactions (user_id, symbol, shares, price) VALUES (?, ?, ?, ?)", session["user_id"], symbol, shares, quote["price"])
+        db.execute(
+            "INSERT INTO transactions (user_id, symbol, shares, price) VALUES (?, ?, ?, ?)",
+            session["user_id"],
+            symbol,
+            shares,
+            quote["price"],
+        )
 
         flash("Bought!")
         return redirect("/")
@@ -99,7 +128,11 @@ def buy():
 @app.route("/history")
 @login_required
 def history():
-    transactions = db.execute("SELECT symbol, shares, price, transacted FROM transactions WHERE user_id = ? ORDER BY transacted DESC", session["user_id"])
+    """Show history of transactions"""
+    transactions = db.execute(
+        "SELECT symbol, shares, price, transacted FROM transactions WHERE user_id = ? ORDER BY transacted DESC",
+        session["user_id"],
+    )
 
     return render_template("history.html", transactions=transactions)
 
@@ -171,9 +204,11 @@ def quote():
     else:
         return render_template("quote.html")
 
+
 @app.route("/change_password", methods=["GET", "POST"])
 @login_required
 def change_password():
+    """Change user's password"""
     if request.method == "POST":
         current_password = request.form.get("current_password")
         new_password = request.form.get("new_password")
@@ -189,15 +224,19 @@ def change_password():
         rows = db.execute("SELECT * FROM users WHERE id = ?", session["user_id"])
 
         if not check_password_hash(rows[0]["hash"], current_password):
-            return apology("current password is incorrect",400)
+            return apology("current password is incorrect", 400)
 
         new_hash = generate_password_hash(new_password)
-        db.execute("UPDATE users SET hash = ? WHERE id = ?", new_hash, session["user_id"])
+        db.execute(
+            "UPDATE users SET hash = ? WHERE id = ?", new_hash, session["user_id"]
+        )
 
-        flash("password changed successfully!")
+        flash("Password changed successfully!")
         return redirect("/")
     else:
         return render_template("change_password.html")
+
+
 @app.route("/register", methods=["GET", "POST"])
 def register():
     """Register user"""
@@ -217,8 +256,10 @@ def register():
         hash = generate_password_hash(password)
 
         try:
-            db.execute("INSERT INTO users (username, hash) VALUES (?,?)", username, hash)
-        except:
+            db.execute(
+                "INSERT INTO users (username, hash) VALUES (?, ?)", username, hash
+            )
+        except Exception:
             return apology("username already exists", 400)
 
         rows = db.execute("SELECT * FROM users WHERE username = ?", username)
@@ -246,7 +287,10 @@ def sell():
 
         shares = int(shares)
         rows = db.execute(
-                "SELECT SUM(shares) as total_shares FROM transactions WHERE user_id = ? AND symbol = ? GROUP BY symbol" ,session["user_id"], symbol)
+            "SELECT SUM(shares) as total_shares FROM transactions WHERE user_id = ? AND symbol = ? GROUP BY symbol",
+            session["user_id"],
+            symbol,
+        )
 
         if not rows or rows[0]["total_shares"] < shares:
             return apology("not enough shares", 400)
@@ -257,16 +301,32 @@ def sell():
 
         total_value = shares * quote["price"]
 
-        db.execute("UPDATE users SET cash = cash + ? WHERE id = ?", total_value, session["user_id"])
-        db.execute("INSERT INTO transactions (user_id, symbol, shares, price) VALUES(?, ?, ?, ?)" ,session["user_id"], symbol, -shares, quote["price"])
+        db.execute(
+            "UPDATE users SET cash = cash + ? WHERE id = ?",
+            total_value,
+            session["user_id"],
+        )
+        db.execute(
+            "INSERT INTO transactions (user_id, symbol, shares, price) VALUES (?, ?, ?, ?)",
+            session["user_id"],
+            symbol,
+            -shares,
+            quote["price"],
+        )
 
-        flash("sold!")
+        flash("Sold!")
         return redirect("/")
 
     else:
-        stocks = db.execute("SELECT symbol FROM transactions WHERE user_id = ? GROUP BY symbol HAVING SUM(shares) > 0", session["user_id"])
+        stocks = db.execute(
+            "SELECT symbol FROM transactions WHERE user_id = ? GROUP BY symbol HAVING SUM(shares) > 0",
+            session["user_id"],
+        )
 
         return render_template("sell.html", stocks=stocks)
 
 
-
+# Entry point for production execution
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
