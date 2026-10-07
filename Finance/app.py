@@ -1,8 +1,8 @@
 import os
 
-from cs50 import SQL
 from flask import Flask, flash, redirect, render_template, request, session
 from flask_session import Session
+from sqlalchemy import create_engine, text
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from helpers import apology, login_required, lookup, usd
@@ -21,15 +21,27 @@ app.config["SESSION_PERMANENT"] = False
 app.config["SESSION_TYPE"] = "filesystem"
 Session(app)
 
-# Configure Database Connection (Supports PostgreSQL in production & fallback to SQLite)
+# Configure Database Connection using SQLAlchemy Engine
 db_url = os.environ.get("DATABASE_URL")
 if db_url:
-    # Heroku / Render use "postgres://", which SQLAlchemy / cs50 expects as "postgresql://"
+    # Heroku / Render use "postgres://", which SQLAlchemy expects as "postgresql://"
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
-    db = SQL(db_url)
+    engine = create_engine(db_url)
 else:
-    db = SQL(f"sqlite:///{os.path.join(app.root_path, 'finance.db')}")
+    db_path = os.path.join(app.root_path, "finance.db")
+    engine = create_engine(f"sqlite:///{db_path}")
+
+
+# Helper function to mimic cs50 db.execute behavior
+def db_execute(query_str, **params):
+    """Executes SQL query using SQLAlchemy engine and returns results as dicts."""
+    with engine.connect() as connection:
+        result = connection.execute(text(query_str), params)
+        if result.returns_rows:
+            return [dict(row._mapping) for row in result.fetchall()]
+        connection.commit()
+        return None
 
 
 @app.after_request
@@ -45,12 +57,12 @@ def after_request(response):
 @login_required
 def index():
     """Show portfolio of stocks"""
-    rows = db.execute("SELECT cash FROM users WHERE id = ?", session["user_id"])
+    rows = db_execute("SELECT cash FROM users WHERE id = :user_id", user_id=session["user_id"])
     cash = rows[0]["cash"]
 
-    stocks = db.execute(
-        "SELECT symbol, SUM(shares) as total_shares FROM transactions WHERE user_id = ? GROUP BY symbol HAVING total_shares > 0",
-        session["user_id"],
+    stocks = db_execute(
+        "SELECT symbol, SUM(shares) as total_shares FROM transactions WHERE user_id = :user_id GROUP BY symbol HAVING SUM(shares) > 0",
+        user_id=session["user_id"],
     )
 
     portfolio = []
@@ -98,24 +110,24 @@ def buy():
 
         total_cost = shares * quote["price"]
 
-        rows = db.execute("SELECT cash FROM users WHERE id = ?", session["user_id"])
+        rows = db_execute("SELECT cash FROM users WHERE id = :user_id", user_id=session["user_id"])
         cash = rows[0]["cash"]
 
         if total_cost > cash:
             return apology("can't afford", 400)
 
-        db.execute(
-            "UPDATE users SET cash = cash - ? WHERE id = ?",
-            total_cost,
-            session["user_id"],
+        db_execute(
+            "UPDATE users SET cash = cash - :total_cost WHERE id = :user_id",
+            total_cost=total_cost,
+            user_id=session["user_id"],
         )
 
-        db.execute(
-            "INSERT INTO transactions (user_id, symbol, shares, price) VALUES (?, ?, ?, ?)",
-            session["user_id"],
-            symbol,
-            shares,
-            quote["price"],
+        db_execute(
+            "INSERT INTO transactions (user_id, symbol, shares, price) VALUES (:user_id, :symbol, :shares, :price)",
+            user_id=session["user_id"],
+            symbol=symbol,
+            shares=shares,
+            price=quote["price"],
         )
 
         flash("Bought!")
@@ -129,9 +141,9 @@ def buy():
 @login_required
 def history():
     """Show history of transactions"""
-    transactions = db.execute(
-        "SELECT symbol, shares, price, transacted FROM transactions WHERE user_id = ? ORDER BY transacted DESC",
-        session["user_id"],
+    transactions = db_execute(
+        "SELECT symbol, shares, price, transacted FROM transactions WHERE user_id = :user_id ORDER BY transacted DESC",
+        user_id=session["user_id"],
     )
 
     return render_template("history.html", transactions=transactions)
@@ -155,8 +167,8 @@ def login():
             return apology("must provide password", 403)
 
         # Query database for username
-        rows = db.execute(
-            "SELECT * FROM users WHERE username = ?", request.form.get("username")
+        rows = db_execute(
+            "SELECT * FROM users WHERE username = :username", username=request.form.get("username")
         )
 
         # Ensure username exists and password is correct
@@ -221,14 +233,14 @@ def change_password():
         if new_password != confirmation:
             return apology("new passwords do not match", 400)
 
-        rows = db.execute("SELECT * FROM users WHERE id = ?", session["user_id"])
+        rows = db_execute("SELECT * FROM users WHERE id = :user_id", user_id=session["user_id"])
 
         if not check_password_hash(rows[0]["hash"], current_password):
             return apology("current password is incorrect", 400)
 
         new_hash = generate_password_hash(new_password)
-        db.execute(
-            "UPDATE users SET hash = ? WHERE id = ?", new_hash, session["user_id"]
+        db_execute(
+            "UPDATE users SET hash = :hash WHERE id = :user_id", hash=new_hash, user_id=session["user_id"]
         )
 
         flash("Password changed successfully!")
@@ -253,16 +265,16 @@ def register():
         if password != confirmation:
             return apology("passwords do not match", 400)
 
-        hash = generate_password_hash(password)
+        pwd_hash = generate_password_hash(password)
 
         try:
-            db.execute(
-                "INSERT INTO users (username, hash) VALUES (?, ?)", username, hash
+            db_execute(
+                "INSERT INTO users (username, hash) VALUES (:username, :hash)", username=username, hash=pwd_hash
             )
         except Exception:
             return apology("username already exists", 400)
 
-        rows = db.execute("SELECT * FROM users WHERE username = ?", username)
+        rows = db_execute("SELECT * FROM users WHERE username = :username", username=username)
 
         session["user_id"] = rows[0]["id"]
         return redirect("/")
@@ -286,10 +298,10 @@ def sell():
             return apology("must have positive integer number of shares", 400)
 
         shares = int(shares)
-        rows = db.execute(
-            "SELECT SUM(shares) as total_shares FROM transactions WHERE user_id = ? AND symbol = ? GROUP BY symbol",
-            session["user_id"],
-            symbol,
+        rows = db_execute(
+            "SELECT SUM(shares) as total_shares FROM transactions WHERE user_id = :user_id AND symbol = :symbol GROUP BY symbol",
+            user_id=session["user_id"],
+            symbol=symbol,
         )
 
         if not rows or rows[0]["total_shares"] < shares:
@@ -301,26 +313,26 @@ def sell():
 
         total_value = shares * quote["price"]
 
-        db.execute(
-            "UPDATE users SET cash = cash + ? WHERE id = ?",
-            total_value,
-            session["user_id"],
+        db_execute(
+            "UPDATE users SET cash = cash + :total_value WHERE id = :user_id",
+            total_value=total_value,
+            user_id=session["user_id"],
         )
-        db.execute(
-            "INSERT INTO transactions (user_id, symbol, shares, price) VALUES (?, ?, ?, ?)",
-            session["user_id"],
-            symbol,
-            -shares,
-            quote["price"],
+        db_execute(
+            "INSERT INTO transactions (user_id, symbol, shares, price) VALUES (:user_id, :symbol, :shares, :price)",
+            user_id=session["user_id"],
+            symbol=symbol,
+            shares=-shares,
+            price=quote["price"],
         )
 
         flash("Sold!")
         return redirect("/")
 
     else:
-        stocks = db.execute(
-            "SELECT symbol FROM transactions WHERE user_id = ? GROUP BY symbol HAVING SUM(shares) > 0",
-            session["user_id"],
+        stocks = db_execute(
+            "SELECT symbol FROM transactions WHERE user_id = :user_id GROUP BY symbol HAVING SUM(shares) > 0",
+            user_id=session["user_id"],
         )
 
         return render_template("sell.html", stocks=stocks)
